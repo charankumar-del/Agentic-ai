@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+.env
+
+# Streamlit
+.streamlit/
+
+# Local files
+*.jpg
+*.png
+*.pdf
+runs/
+tmp/
+
+# Model weights (optional if large)
+best.pt
+
+# Virtual environment
+.venv/
+venv/
