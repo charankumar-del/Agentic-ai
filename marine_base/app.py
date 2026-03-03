@@ -6,6 +6,9 @@ import random
 import time
 import uuid
 
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
 # Import our new AI Consulting Agent brain
 import agent 
 
@@ -26,9 +29,48 @@ MODEL_RECALL = 0.844
 MODEL_MAP50 = 0.882
 MODEL_MAP5095 = 0.782
 
-# ---------------- LOAD MODEL ----------------
-MODEL_PATH = "best.pt"
-model = YOLO(MODEL_PATH)
+# ---------------- LOAD MODEL (with fallback + self-healing) ----------------
+PRIMARY_MODEL_PATH = "best.pt"
+FALLBACK_MODEL_NAME = os.getenv("YOLO_FALLBACK_MODEL", "yolov8n.pt")
+
+MODEL_LOAD_ERROR = None
+MODEL_USING_FALLBACK = False
+model = None
+
+try:
+    # Try to load the project-specific trained weights first.
+    model = YOLO(PRIMARY_MODEL_PATH)
+except Exception as primary_err:
+    try:
+        # First attempt to load a generic YOLOv8 model.
+        model = YOLO(FALLBACK_MODEL_NAME)
+        MODEL_USING_FALLBACK = True
+    except Exception as fallback_err:
+        retry_err = None
+
+        # If the fallback error indicates a corrupted local .pt file, delete it
+        # and retry once so Ultralytics can re-download a fresh copy.
+        if (
+            "PytorchStreamReader failed reading zip archive" in str(fallback_err)
+            and os.path.exists(FALLBACK_MODEL_NAME)
+        ):
+            try:
+                os.remove(FALLBACK_MODEL_NAME)
+                model = YOLO(FALLBACK_MODEL_NAME)
+                MODEL_USING_FALLBACK = True
+                fallback_err = None  # Clear error since retry succeeded
+            except Exception as e2:
+                retry_err = e2
+
+        if fallback_err is not None:
+            # Both primary and fallback ultimately failed
+            base_msg = (
+                f"Primary model '{PRIMARY_MODEL_PATH}' failed with: {primary_err}. "
+                f"Fallback model '{FALLBACK_MODEL_NAME}' also failed with: {fallback_err}."
+            )
+            if retry_err is not None:
+                base_msg += f" Retry after deleting local fallback file also failed with: {retry_err}."
+            MODEL_LOAD_ERROR = base_msg
 
 # ---------------- SIDEBAR ROLE ----------------
 st.sidebar.title("Navigation")
@@ -41,6 +83,24 @@ if mode == "User":
 
     st.title("🚢 AI Underwater Inspection System")
     st.markdown("Upload subsea infrastructure imagery to receive autonomous risk analysis and compliance reports.")
+
+    # If we are running with a generic YOLO fallback model, let the user know.
+    if MODEL_USING_FALLBACK and not MODEL_LOAD_ERROR:
+        st.info(
+            f"Using fallback vision model '{FALLBACK_MODEL_NAME}' because "
+            f"'{PRIMARY_MODEL_PATH}' could not be loaded."
+        )
+
+    # If the YOLO model failed to load (e.g., corrupted or missing weights),
+    # show a clear message instead of crashing the whole app.
+    if MODEL_LOAD_ERROR:
+        st.error(
+            "Vision model failed to load, and no fallback model is available. "
+            "Please ensure you have a valid Ultralytics/YOLOv8 model file "
+            "accessible to the app.\n\n"
+            f"Details: {MODEL_LOAD_ERROR}"
+        )
+        st.stop()
 
     confidence_threshold = st.sidebar.slider(
         "Confidence Threshold", 0.1, 1.0, 0.25, 0.05
@@ -111,28 +171,40 @@ if mode == "User":
                 )
                 st.write("⏱ Inference Time:", inference_time, "sec")
 
-            # --- STEP 2: Agentic Compliance Report ---
+            # --- STEP 2: Agentic Compliance Report (PDF) ---
             st.markdown("---")
             st.subheader("🤖 Agentic Compliance & Integrity Assessment")
             
             inspection_id = f"INS-{random.randint(1000,9999)}"
-            report_name = f"{inspection_id}_compliance_report.txt"
+            pdf_name = f"{inspection_id}_compliance_report.pdf"
 
             with st.spinner("Agent is cross-referencing DNV/API maritime regulations..."):
-                
                 # Fetching the expert assessment from agent.py
                 agent_report = agent.generate_compliance_report(detection_table, risk)
-                
-                # Displaying report in the UI
+
+                # Displaying report in the UI (text)
                 st.write(agent_report)
 
-                # Saving local copy for upload
-                with open(report_name, "w", encoding="utf-8") as f:
-                    f.write(f"INSPECTION ID: {inspection_id}\n")
-                    f.write(f"TIMESTAMP: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                    f.write(f"VISUAL RISK LEVEL: {risk}\n")
-                    f.write("-" * 30 + "\n\n")
-                    f.write(agent_report)
+                # Generate a PDF version of the report
+                width, height = A4
+                c = canvas.Canvas(pdf_name, pagesize=A4)
+                text_obj = c.beginText(50, height - 50)
+                text_obj.setFont("Helvetica", 11)
+
+                header_lines = [
+                    f"INSPECTION ID: {inspection_id}",
+                    f"TIMESTAMP: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"VISUAL RISK LEVEL: {risk}",
+                    "-" * 60,
+                    "",
+                ]
+
+                for line in header_lines + agent_report.splitlines():
+                    text_obj.textLine(line)
+
+                c.drawText(text_obj)
+                c.showPage()
+                c.save()
 
             # --- STEP 3: Sync to Supabase ---
             try:
@@ -140,8 +212,8 @@ if mode == "User":
                 image_url = upload_file("image_bucket", original_filename)
                 annotated_url = upload_file("image_bucket", annotated_path)
                 
-                # Uploading the agent's consulting draft
-                report_url = upload_file("image_bucket", report_name)
+                # Uploading the agent's PDF report
+                pdf_url = upload_file("image_bucket", pdf_name)
 
                 insert_inspection({
                     "inspection_id": inspection_id,
@@ -156,22 +228,26 @@ if mode == "User":
                     "map5095": MODEL_MAP5095,
                     "image_url": image_url,
                     "annotated_image_url": annotated_url,
-                    "pdf_url": report_url, # Reusing this column for our .txt report
+                    "pdf_url": pdf_url,
                     "status": "completed"
                 })
 
                 st.success("Synchronized with Secure Storage ✅")
 
             except Exception as e:
-                st.error(f"Synchronization Error: {e}")
-
-            # Download Option
-            with open(report_name, "rb") as f:
+                msg = str(e)
+                if "Supabase is not configured" in msg:
+                    st.info("Cloud synchronization is disabled because Supabase is not configured. PDF download is still available below.")
+                else:
+                    st.error(f"Synchronization Error: {e}")
+            
+            # Download Option (PDF)
+            with open(pdf_name, "rb") as f:
                 st.download_button(
-                    "⬇ Download Integrity Assessment (.txt)",
+                    "⬇ Download Integrity Assessment (PDF)",
                     f,
-                    file_name=report_name,
-                    mime="text/plain"
+                    file_name=pdf_name,
+                    mime="application/pdf"
                 )
 
 # =====================================================

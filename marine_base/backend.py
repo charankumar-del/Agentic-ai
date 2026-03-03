@@ -5,6 +5,9 @@ import os
 import random
 import time
 import uuid
+
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 import agent  # Orchestrating the logic processor from agent.py
 
 from supabase_client import (
@@ -22,8 +25,42 @@ st.set_page_config(page_title="Deep-Edge Pipeline OS", layout="wide")
 MODEL_PRECISION, MODEL_RECALL = 0.886, 0.844
 MODEL_MAP50, MODEL_MAP5095 = 0.882, 0.782
 
-# Load YOLO Model
-model = YOLO("best.pt")
+# Load YOLO Model with fallback and self-healing so the app can still start
+PRIMARY_MODEL_PATH = "best.pt"
+FALLBACK_MODEL_NAME = os.getenv("YOLO_FALLBACK_MODEL", "yolov8n.pt")
+
+MODEL_LOAD_ERROR = None
+MODEL_USING_FALLBACK = False
+model = None
+
+try:
+    model = YOLO(PRIMARY_MODEL_PATH)
+except Exception as primary_err:
+    try:
+        model = YOLO(FALLBACK_MODEL_NAME)
+        MODEL_USING_FALLBACK = True
+    except Exception as fallback_err:
+        retry_err = None
+        if (
+            "PytorchStreamReader failed reading zip archive" in str(fallback_err)
+            and os.path.exists(FALLBACK_MODEL_NAME)
+        ):
+            try:
+                os.remove(FALLBACK_MODEL_NAME)
+                model = YOLO(FALLBACK_MODEL_NAME)
+                MODEL_USING_FALLBACK = True
+                fallback_err = None
+            except Exception as e2:
+                retry_err = e2
+
+        if fallback_err is not None:
+            base_msg = (
+                f"Primary model '{PRIMARY_MODEL_PATH}' failed with: {primary_err}. "
+                f"Fallback model '{FALLBACK_MODEL_NAME}' also failed with: {fallback_err}."
+            )
+            if retry_err is not None:
+                base_msg += f" Retry after deleting local fallback file also failed with: {retry_err}."
+            MODEL_LOAD_ERROR = base_msg
 
 st.sidebar.title("Navigation")
 mode = st.sidebar.radio("Select Mode", ["User", "Admin"])
@@ -34,6 +71,30 @@ mode = st.sidebar.radio("Select Mode", ["User", "Admin"])
 if mode == "User":
     st.title("🌊 Pipeline Risk OS: Autonomous Inspector")
     st.markdown("Upload subsea data for AI analysis and compliance reports.")
+
+    if MODEL_USING_FALLBACK and not MODEL_LOAD_ERROR:
+        st.info(
+            f"Using fallback vision model '{FALLBACK_MODEL_NAME}' because "
+            f"'{PRIMARY_MODEL_PATH}' could not be loaded."
+        )
+
+    if MODEL_LOAD_ERROR:
+        st.error(
+            "Vision model failed to load, and no fallback model is available. "
+            "Please ensure you have a valid Ultralytics/YOLOv8 model file "
+            "accessible to the app.\n\n"
+            f"Details: {MODEL_LOAD_ERROR}"
+        )
+        st.stop()
+
+    # Guard against missing/corrupted YOLO weights
+    if MODEL_LOAD_ERROR:
+        st.error(
+            "Vision model failed to load. Please ensure `best.pt` is a valid "
+            "Ultralytics/YOLOv8 model file in the app directory.\n\n"
+            f"Details: {MODEL_LOAD_ERROR}"
+        )
+        st.stop()
 
     conf_thresh = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.25, 0.05)
     uploaded_file = st.file_uploader("Upload ROV Image", type=["jpg","png","jpeg"])
@@ -83,26 +144,44 @@ if mode == "User":
                 st.markdown(f"### ⚠ Risk Level: <span style='color:{color}'>{risk}</span>", unsafe_allow_html=True)
                 st.write(f"⏱ Inference: {inference_time} sec")
 
-            # Step 2: Agentic Compliance Report (Interpretation Phase)
+            # Step 2: Agentic Compliance Report (Interpretation Phase, PDF)
             st.markdown("---")
             st.subheader("🤖 Agentic Compliance Assessment")
             inspection_id = f"INS-{random.randint(1000,9999)}"
-            report_name = f"{inspection_id}_report.txt"
+            pdf_name = f"{inspection_id}_report.pdf"
 
             with st.spinner("Agent consulting DNV regulations..."):
                 # Passing technical metadata to the agent for interpretation
                 agent_report = agent.generate_compliance_report(detection_table, risk)
                 st.write(agent_report)
-                
-                with open(report_name, "w", encoding="utf-8") as f:
-                    f.write(f"ID: {inspection_id} | Date: {datetime.now()}\n\n{agent_report}")
+
+                # Generate PDF
+                width, height = A4
+                c = canvas.Canvas(pdf_name, pagesize=A4)
+                text_obj = c.beginText(50, height - 50)
+                text_obj.setFont("Helvetica", 11)
+
+                header_lines = [
+                    f"ID: {inspection_id}",
+                    f"DATE: {datetime.now()}",
+                    f"RISK LEVEL: {risk}",
+                    "-" * 60,
+                    "",
+                ]
+
+                for line in header_lines + agent_report.splitlines():
+                    text_obj.textLine(line)
+
+                c.drawText(text_obj)
+                c.showPage()
+                c.save()
 
             # Step 3: Supabase Sync (Deployment Phase)
             try:
                 # Synchronizing vision data and agent outputs to the cloud
                 img_url = upload_file("image_bucket", original_filename)
                 ann_url = upload_file("image_bucket", annotated_path)
-                rep_url = upload_file("image_bucket", report_name)
+                pdf_url = upload_file("image_bucket", pdf_name)
 
                 insert_inspection({
                     "inspection_id": inspection_id, 
@@ -117,15 +196,19 @@ if mode == "User":
                     "map5095": MODEL_MAP5095,
                     "image_url": img_url, 
                     "annotated_image_url": ann_url,
-                    "pdf_url": rep_url, # Key 'pdf_url' used to store the link to the .txt report
+                    "pdf_url": pdf_url,
                     "status": "completed"
                 })
                 st.success("Inspection Synchronized ✅")
             except Exception as e:
-                st.error(f"Sync Error: {e}")
+                msg = str(e)
+                if "Supabase is not configured" in msg:
+                    st.info("Cloud synchronization is disabled because Supabase is not configured. PDF download is still available below.")
+                else:
+                    st.error(f"Sync Error: {e}")
 
-            with open(report_name, "rb") as f:
-                st.download_button("⬇ Download Report (.txt)", f, file_name=report_name)
+            with open(pdf_name, "rb") as f:
+                st.download_button("⬇ Download Report (PDF)", f, file_name=pdf_name, mime="application/pdf")
 
 # =====================================================
 # ======================= ADMIN MODE ===================
